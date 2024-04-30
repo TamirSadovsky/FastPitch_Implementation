@@ -24,7 +24,6 @@ from fastpitch.model import FastPitch
 from fastpitch.model_jit import FastPitchJIT
 from hifigan.models import Generator
 
-'''
 try:
     from waveglow.model import WaveGlow
     from waveglow import model as glow
@@ -32,7 +31,7 @@ try:
     sys.modules['glow'] = glow
 except ImportError:
     print("WARNING: Couldn't import WaveGlow")
-'''
+
 
 def parse_model_args(model_name, parser, add_help=False):
     if model_name == 'FastPitch':
@@ -232,6 +231,7 @@ def load_model_from_ckpt(checkpoint_data, model, key='state_dict'):
 def load_and_setup_model(model_name, parser, checkpoint, amp, device,
                          unk_args=[], forward_is_infer=False, jitable=False):
     if checkpoint is not None:
+        print(checkpoint)
         ckpt_data = torch.load(checkpoint)
         print(f'{model_name}: Loading {checkpoint}...')
         ckpt_config = ckpt_data.get('config')

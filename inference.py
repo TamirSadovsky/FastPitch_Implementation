@@ -38,7 +38,7 @@ from common.text import cmudict
 from common.text.text_processing import get_text_processing
 from common.utils import l2_promote
 from fastpitch.pitch_transform import pitch_transform_custom
-import librosa
+from hifigan.data_function import MAX_WAV_VALUE, mel_spectrogram
 
 
 CHECKPOINT_SPECIFIC_ARGS = [
@@ -113,13 +113,6 @@ def parse_args(parser):
                                  'socket_unique_continuous',
                                  'disabled'],
                         help='type of CPU affinity')
-    
-    parser.add_argument('--mel_only', action='store_true', default=False)
-    parser.add_argument('--n_iter', type=int, default=100, help='Number of iterations for Griffin-Lim algorithm')
-    parser.add_argument('--n_fft', type=int, default=1024, help='Number of FFT points for Griffin-Lim algorithm')
-    parser.add_argument('--hop_length', type=int, default=256, help='Hop length for Griffin-Lim algorithm')
-    parser.add_argument('--win_length', type=int, default=1024, help='Window length for Griffin-Lim algorithm')
-
 
     transf = parser.add_argument_group('transform')
     transf.add_argument('--fade-out', type=int, default=10,
@@ -238,6 +231,35 @@ def build_pitch_transformation(args):
     return eval(f'lambda pitch, pitch_lens, mean, std: {fun}')
 
 
+def setup_mel_loss_reporting(args, voc_train_setup):
+    if args.denoising_strength > 0.0:
+        print('WARNING: denoising will be included in vocoder mel loss')
+    num_mels = voc_train_setup.get('num_mels', 80)
+    fmin = voc_train_setup.get('mel_fmin', 0)
+    fmax = voc_train_setup.get('mel_fmax', 8000)  # not mel_fmax_loss
+
+    def compute_audio_mel_loss(gen_audios, gt_mels, mel_lens):
+        gen_audios /= MAX_WAV_VALUE
+        total_loss = 0
+        for gen_audio, gt_mel, mel_len in zip(gen_audios, gt_mels, mel_lens):
+            mel_len = mel_len.item()
+            gen_audio = gen_audio[None, :mel_len * args.hop_length]
+            gen_mel = mel_spectrogram(gen_audio, args.win_length, num_mels,
+                                      args.sampling_rate, args.hop_length,
+                                      args.win_length, fmin, fmax)[0]
+            total_loss += l1_loss(gen_mel, gt_mel[:, :mel_len])
+        return total_loss.item()
+
+    return compute_audio_mel_loss
+
+
+def compute_mel_loss(mels, lens, gt_mels, gt_lens):
+    total_loss = 0
+    for mel, len_, gt_mel, gt_len in zip(mels, lens, gt_mels, gt_lens):
+        min_len = min(len_, gt_len)
+        total_loss += l1_loss(gt_mel[:, :min_len], mel[:, :min_len])
+    return total_loss.item()
+
 
 class MeasureTime(list):
     def __init__(self, *args, cuda=True, **kwargs):
@@ -258,22 +280,6 @@ class MeasureTime(list):
         assert len(self) == len(other)
         return MeasureTime((sum(ab) for ab in zip(self, other)), cuda=self.cuda)
 
-def generate_mel(generator, input_text):
-    with torch.no_grad(), _:
-                mel, mel_lens, *_ = generator(input_text,{'pace': 1.0,
-              'speaker': 0.0,
-              'pitch_tgt': None})
-    return mel, mel_lens
-
-def griffin_lim_vocoder(mel, args):
-    S = np.array(mel)
-    n_iter = args.n_iter
-    n_fft = args.n_fft
-    hop_length = args.hop_length
-    win_length = args.win_length
-
-    t = librosa.griffinlim(S, n_iter=n_iter, hop_length=hop_length, win_length=win_length, n_fft=n_fft)
-    return torch.tensor(t)
 
 def main():
     """
@@ -296,7 +302,7 @@ def main():
 
     if args.l2_promote:
         l2_promote()
-    #torch.backends.cudnn.benchmark = args.cudnn_benchmark
+    torch.backends.cudnn.benchmark = args.cudnn_benchmark
 
     if args.output is not None:
         Path(args.output).mkdir(parents=False, exist_ok=True)
@@ -345,45 +351,6 @@ def main():
         gen_name = 'fastpitch'
         generator, gen_train_setup = _load_pyt_or_ts_model('FastPitch',
                                                            args.fastpitch)
-    
-    if args.waveglow is not None:
-        voc_name = 'waveglow'
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            vocoder, _, voc_train_setup = models.load_and_setup_model(
-                'WaveGlow', parser, args.waveglow, args.amp, device,
-                unk_args=unk_args, forward_is_infer=True, jitable=False)
-
-        # if args.torchscript:
-        #     vocoder = torch.jit.script(vocoder)
-
-        def generate_audio(mel):
-            audios = vocoder(mel, sigma=args.waveglow_sigma_infer)
-            if denoiser is not None:
-                audios = denoiser(audios.float(), args.denoising_strength).squeeze(1)
-            return audios
-
-    elif args.hifigan is not None:
-        voc_name = 'hifigan'
-        vocoder, voc_train_setup = _load_pyt_or_ts_model('HiFi-GAN',
-                                                         args.hifigan)
-
-        if args.torch_tensorrt:
-            vocoder = models.convert_ts_to_trt('HiFi-GAN', vocoder, parser,
-                                               args.amp, unk_args)
-        if not args.mel_only:
-            def generate_audio(mel):
-                audios = vocoder(mel).float()
-                if denoiser is not None:
-                    audios = denoiser(audios.squeeze(1), args.denoising_strength)
-                return audios.squeeze(1) * args.max_wav_value
-        
-        else:
-            vocoder = None
-            voc_name = 'mel_only'
-            def generate_audio(mel):
-                return griffin_lim_vocoder(mel, args)
-            
     if len(unk_args) > 0:
         raise ValueError(f'Invalid options {unk_args}')
 
@@ -415,6 +382,9 @@ def main():
     if args.p_arpabet > 0.0:
         cmudict.initialize(args.cmudict_path, args.heteronyms_path)
 
+    if args.report_mel_loss:
+        mel_loss_fn = setup_mel_loss_reporting(args, voc_train_setup)
+
     fields = load_fields(args.input)
     batches = prepare_input_sequence(
         fields, device, args.symbol_set, args.text_cleaners, args.batch_size,
@@ -432,8 +402,6 @@ def main():
                 mel, mel_lens = b['mel'], b['mel_lens']
                 if args.amp:
                     mel = mel.half()
-            if vocoder is not None:
-                audios = generate_audio(mel)
 
     gen_measures = MeasureTime(cuda=args.cuda)
     vocoder_measures = MeasureTime(cuda=args.cuda)
@@ -461,21 +429,53 @@ def main():
                 with torch.no_grad(), gen_measures:
                     mel, mel_lens, *_ = generator(b['text'], **gen_kw)
 
+                if args.report_mel_loss:
+                    gen_mel_loss_sum += compute_mel_loss(
+                        mel, mel_lens, b['mel'], b['mel_lens'])
+
+                gen_infer_perf = mel.size(0) * mel.size(2) / gen_measures[-1]
+                all_letters += b['text_lens'].sum().item()
+                all_frames += mel.size(0) * mel.size(2)
+                log(rep, {f"{gen_name}_frames/s": gen_infer_perf})
+                log(rep, {f"{gen_name}_latency": gen_measures[-1]})
+
                 if args.save_mels:
                     for i, mel_ in enumerate(mel):
                         m = mel_[:, :mel_lens[i].item()].permute(1, 0)
                         fname = b['output'][i] if 'output' in b else f'mel_{i}.npy'
                         mel_path = Path(args.output, Path(fname).stem + '.npy')
-                        print("saves to: ", mel_path)
                         np.save(mel_path, m.cpu().numpy())
-                        # make a save to cwd
-                        np.save(Path(Path(fname).stem + '.npy'), m.cpu().numpy())
-                        print("saves to: ", Path(Path(fname).stem + '.npy'))
+
+                vocoder_infer_perf = (
+                    audios.size(0) * audios.size(1) / vocoder_measures[-1])
+
+                log(rep, {f"{voc_name}_samples/s": vocoder_infer_perf})
+                log(rep, {f"{voc_name}_latency": vocoder_measures[-1]})
+
+                if args.report_mel_loss:
+                    voc_mel_loss_sum += mel_loss_fn(audios, mel, mel_lens)
+
+                if args.output is not None and reps == 1:
+                    for i, audio in enumerate(audios):
+                        audio = audio[:mel_lens[i].item() * args.hop_length]
+
+                        if args.fade_out:
+                            fade_len = args.fade_out * args.hop_length
+                            fade_w = torch.linspace(1.0, 0.0, fade_len)
+                            audio[-fade_len:] *= fade_w.to(audio.device)
+
+                        audio = audio / torch.max(torch.abs(audio))
+                        fname = b['output'][i] if 'output' in b else f'audio_{all_utterances + i}.wav'
+                        audio_path = Path(args.output, fname)
+                        write(audio_path, args.sampling_rate, audio.cpu().numpy())
+
+                if generator is not None:
+                    log(rep, {"latency": (gen_measures[-1] + vocoder_measures[-1])})
 
             all_utterances += mel.size(0)
             all_samples += mel_lens.sum().item() * args.hop_length
             all_batches += 1
-
+    voc_name = ""
     log_enabled = True
     if generator is not None:
         gm = np.sort(np.asarray(gen_measures))
@@ -516,9 +516,6 @@ def main():
         log((), {"90%_latency": m.mean() + norm.ppf((1.0 + 0.90) / 2) * m.std()})
         log((), {"95%_latency": m.mean() + norm.ppf((1.0 + 0.95) / 2) * m.std()})
         log((), {"99%_latency": m.mean() + norm.ppf((1.0 + 0.99) / 2) * m.std()})
-    if args.mel_only:
-        # return the mel spectrogram model only
-        return generator
     DLLogger.flush()
 
 
