@@ -1,4 +1,9 @@
-Important! in both links, we use our google drive to store and access the dataset. Make sure that our "Deep Audio" folder is shared with you.
+Since downloading the dataset may take a while, we've shared the dataset folder with you. Please follow these steps:
+
+1. Go to the "Shared with me" section in Google Drive.
+2. Look for the folders named "LJSpeech-1.1" and "Deep Audio".
+3. Right-click on the folder, then select 'Organize' -> 'Create shortcut' -> 'My Drive'.
+4. Once you've added the folder to your Google Drive, proceed to run the next steps in the Colab notebook."
 
 [Link](https://colab.research.google.com/drive/1dfpGbbJ_UBcvvUfqin07JDN6Bg9oM-kc) to inference notebook, where we conducted the expiriments.
 
