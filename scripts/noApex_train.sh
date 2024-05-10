@@ -5,7 +5,7 @@ echo "in new_train.sh"
 export OMP_NUM_THREADS=1
 
 : ${NUM_GPUS:=4}
-: ${BATCH_SIZE:=8}
+: ${BATCH_SIZE:=16}
 : ${GRAD_ACCUMULATION:=2}
 : ${OUTPUT_DIR:="./output4"}
 : ${LOG_FILE:=$OUTPUT_DIR/nvlog.json}
@@ -15,7 +15,7 @@ export OMP_NUM_THREADS=1
 : ${AMP:=false}
 : ${SEED:=""}
 
-: ${LEARNING_RATE:=0.01}
+: ${LEARNING_RATE:=0.1}
 : ${WORLD_SIZE:=1}
 
 # Adjust these when the amount of data changes
@@ -102,3 +102,4 @@ fi
 mkdir -p "$OUTPUT_DIR"
 
 echo $ARGS
+Python train_noApex.py $ARGS
